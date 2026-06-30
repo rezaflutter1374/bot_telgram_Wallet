@@ -1,0 +1,27 @@
+# Database Schema
+
+Tables:
+
+- `users` (Telegram identity + KYC pointers)
+- `wallets` (available/frozen/margin/equity)
+- `transactions` (deposit/withdraw/internal)
+- `prices` (price history)
+- `orders` (buy/sell requests + quote expiry + receipt)
+- `positions` (net KG + settlement price)
+- `margin_accounts` (ratios/leverage)
+- `settlements` (daily settlement snapshots)
+- `settlement_reports` (generated settlement summaries)
+- `tickets` / `ticket_messages` (support system)
+- `bank_accounts` (encrypted bank numbers)
+- `payment_cards` (encrypted cards attached to bank accounts)
+- `ledger_entries` (accounting journal)
+- `admin_logs` (audit trail)
+- `payment_requests` (deposit/withdraw requests + receipts + review)
+- `journal_accounts` / `journal_entries` / `journal_lines` (double-entry accounting)
+- `notifications` (queued outbound notifications)
+- `audit_events` (structured audit trail)
+- `risk_rules` (exposure limits configuration)
+- `margin_calls` (margin call events)
+- `liquidation_events` (liquidation events)
+- `order_cancellations` (dual-approval cancellation workflow)
+- `roles` / `permissions` / `role_permissions` / `user_roles` (RBAC)

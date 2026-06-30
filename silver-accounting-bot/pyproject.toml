@@ -1,0 +1,23 @@
+[project]
+name = "silver-accounting-bot"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["src/tests"]
+addopts = "-q --disable-warnings --maxfail=1 --cov=src --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = [
+  "src/main.py",
+  "src/infrastructure/db/migrate.py",
+  "src/infrastructure/settlement/engine.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
