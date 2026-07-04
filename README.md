@@ -123,6 +123,6 @@ It includes:
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/your-username/silver-trading-bot.git
+git clone https://github.com/rezaflutter1374/bot_telgram_Wallet.git
 cd silver-trading-bot
 pip install -r requirements.txt
