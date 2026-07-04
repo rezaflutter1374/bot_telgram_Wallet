@@ -221,3 +221,4 @@ __pycache__/
 .venv/
 .coverage
 .env
+.coverage
