@@ -219,3 +219,5 @@ __marimo__/
 __pycache__/
 *.pyc
 .venv/
+.coverage
+.env
