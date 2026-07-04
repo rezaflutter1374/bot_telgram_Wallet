@@ -171,3 +171,87 @@ class BackupCreated(DomainEvent):
 class MaintenanceModeChanged(DomainEvent):
     event_type: str = "system.maintenance_changed"
     category: EventCategory = EventCategory.system
+
+
+@dataclass(frozen=True)
+class OrderPartiallyFilled(DomainEvent):
+    event_type: str = "order.partially_filled"
+    category: EventCategory = EventCategory.order
+
+
+@dataclass(frozen=True)
+class OrderExpired(DomainEvent):
+    event_type: str = "order.expired"
+    category: EventCategory = EventCategory.order
+
+
+@dataclass(frozen=True)
+class OrderRejected(DomainEvent):
+    event_type: str = "order.rejected"
+    category: EventCategory = EventCategory.order
+
+
+@dataclass(frozen=True)
+class OrderReplaced(DomainEvent):
+    event_type: str = "order.replaced"
+    category: EventCategory = EventCategory.order
+
+
+@dataclass(frozen=True)
+class PositionChanged(DomainEvent):
+    event_type: str = "position.changed"
+    category: EventCategory = EventCategory.trade
+
+
+@dataclass(frozen=True)
+class LiquidationTriggered(DomainEvent):
+    event_type: str = "liquidation.triggered"
+    category: EventCategory = EventCategory.margin
+
+
+@dataclass(frozen=True)
+class LiquidationPartial(DomainEvent):
+    event_type: str = "liquidation.partial"
+    category: EventCategory = EventCategory.margin
+
+
+@dataclass(frozen=True)
+class LiquidationCompleted(DomainEvent):
+    event_type: str = "liquidation.completed"
+    category: EventCategory = EventCategory.margin
+
+
+@dataclass(frozen=True)
+class MarginTransferExecuted(DomainEvent):
+    event_type: str = "margin.transfer_executed"
+    category: EventCategory = EventCategory.margin
+
+
+@dataclass(frozen=True)
+class FundingExecuted(DomainEvent):
+    event_type: str = "funding.executed"
+    category: EventCategory = EventCategory.settlement
+
+
+@dataclass(frozen=True)
+class InsuranceUsed(DomainEvent):
+    event_type: str = "insurance.used"
+    category: EventCategory = EventCategory.settlement
+
+
+@dataclass(frozen=True)
+class LedgerEntryPosted(DomainEvent):
+    event_type: str = "ledger.entry_posted"
+    category: EventCategory = EventCategory.audit
+
+
+@dataclass(frozen=True)
+class EmergencyShutdown(DomainEvent):
+    event_type: str = "system.emergency_shutdown"
+    category: EventCategory = EventCategory.system
+
+
+@dataclass(frozen=True)
+class RiskAlertTriggered(DomainEvent):
+    event_type: str = "risk.alert_triggered"
+    category: EventCategory = EventCategory.risk

@@ -7,8 +7,14 @@ from redis.asyncio import Redis
 from application.use_cases.services import AppServices
 from core.security import Encryptor
 from core.settings import Settings
+from domain.services.ledger import LedgerService
 from domain.services.margin import MarginCalculator
+from domain.services.margin_engine import MarginEngine
+from domain.services.matching_engine import MatchingEngine
+from domain.services.position_engine import PositionEngine
 from domain.services.risk_calc import RiskCalculator
+from domain.services.risk_engine import RiskEngine
+from domain.services.liquidation_engine import LiquidationEngine
 from infrastructure.db.session import Database, SqlAlchemyUnitOfWork
 from infrastructure.event_bus.bus import InMemoryEventBus
 from infrastructure.event_bus.store import EventStore
@@ -22,6 +28,8 @@ from infrastructure.repositories.sql_repos import (
     SqlAccountingRepo,
     SqlAuditRepo,
     SqlBackupRepo,
+    SqlLedgerRepo,
+    SqlLiquidationRepo,
     SqlOrderRepo,
     SqlPaymentReconciliationRepo,
     SqlPaymentRepo,
@@ -99,8 +107,17 @@ def build_container(settings: Settings) -> Container:
     price_refresh = PriceRefreshService(settings=settings, db=db, uow=uow, prices=prices)
     settlement_engine = SettlementEngineService(db=db, redis=redis)
     payment_reconciliation = SqlPaymentReconciliationRepo(uow)
+    ledger_repo = SqlLedgerRepo(uow)
+    liquidation_repo = SqlLiquidationRepo(uow)
     event_bus = InMemoryEventBus()
     event_store = EventStore(uow)
+
+    matching_engine = MatchingEngine()
+    ledger_service = LedgerService()
+    position_engine = PositionEngine()
+    margin_engine = MarginEngine(margin_calc)
+    risk_engine = RiskEngine()
+    liquidation_engine = LiquidationEngine()
 
     services = AppServices(
         uow=uow,
@@ -126,6 +143,14 @@ def build_container(settings: Settings) -> Container:
         event_bus=event_bus,
         event_store=event_store,
         payment_reconciliation=payment_reconciliation,
+        ledger_repo=ledger_repo,
+        liquidation_repo=liquidation_repo,
+        matching_engine=matching_engine,
+        ledger_service=ledger_service,
+        position_engine=position_engine,
+        margin_engine=margin_engine,
+        risk_engine=risk_engine,
+        liquidation_engine=liquidation_engine,
     )
 
     return Container(

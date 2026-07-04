@@ -152,8 +152,11 @@ class MarginCallStatus(str, Enum):
 
 class LiquidationStatus(str, Enum):
     triggered = "triggered"
+    in_progress = "in_progress"
+    partial = "partial"
     completed = "completed"
     failed = "failed"
+    avoided = "avoided"
 
 
 class SettlementMode(str, Enum):

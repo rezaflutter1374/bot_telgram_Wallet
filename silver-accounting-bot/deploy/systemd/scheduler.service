@@ -1,0 +1,20 @@
+[Unit]
+Description=Silver Accounting Bot Scheduler
+After=redis.service postgresql.service
+Requires=redis.service postgresql.service
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/silver-accounting-bot
+EnvironmentFile=/opt/silver-accounting-bot/.env
+ExecStart=/opt/silver-accounting-bot/.venv/bin/python -m infrastructure.scheduler.scheduler
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=silver-scheduler
+
+[Install]
+WantedBy=multi-user.target

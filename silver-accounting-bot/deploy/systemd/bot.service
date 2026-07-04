@@ -1,0 +1,20 @@
+[Unit]
+Description=Silver Accounting Bot
+After=network.target redis.service postgresql.service
+Requires=redis.service postgresql.service
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/silver-accounting-bot
+EnvironmentFile=/opt/silver-accounting-bot/.env
+ExecStart=/opt/silver-accounting-bot/.venv/bin/python -m main bot
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=silver-bot
+
+[Install]
+WantedBy=multi-user.target

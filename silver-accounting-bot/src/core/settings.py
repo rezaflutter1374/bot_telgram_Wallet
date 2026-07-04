@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     health_path: str = "/health"
     timezone: str = "Asia/Kabul"
     log_level: str = "INFO"
+    log_format: str = "text"
+    enable_tracing: bool = False
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_service_name: str = "silver-accounting-bot"
 
     db_pool_size: int = Field(default=10, ge=1, le=100)
     db_max_overflow: int = Field(default=20, ge=0, le=200)
@@ -36,6 +40,11 @@ class Settings(BaseSettings):
 
     rate_limit_limit: int = Field(default=30, ge=1, le=1000)
     rate_limit_window_seconds: int = Field(default=10, ge=1, le=3600)
+
+    idempotency_ttl_seconds: int = Field(default=86400, ge=1, le=604800)
+    lock_timeout_seconds: int = Field(default=10, ge=1, le=300)
+    replay_window_seconds: int = Field(default=300, ge=1, le=3600)
+    api_key_header: str = Field(default="X-API-Key")
 
     bot_mode: str = "auto"
     webhook_base_url: str | None = None
@@ -71,6 +80,12 @@ class Settings(BaseSettings):
     margin_liquidation_critical_ratio: Decimal = Decimal("0.50")
     margin_call_threshold_ratio: Decimal = Decimal("1")
     margin_warning_ratio: Decimal = Decimal("1.25")
+
+    backup_directory: str = "./backups"
+    backup_retention_days: int = Field(default=30, ge=1, le=365)
+    backup_cron_expression: str = "0 3 * * *"
+    graceful_shutdown_timeout: int = Field(default=30, ge=5, le=300)
+    enable_auto_backup: bool = False
 
     @property
     def super_admin_ids(self) -> set[int]:
@@ -162,3 +177,11 @@ class Settings(BaseSettings):
         if normalized not in allowed:
             raise ValueError(f"Price provider must be one of {sorted(allowed)}")
         return normalized
+
+    @field_validator("backup_cron_expression")
+    @classmethod
+    def validate_cron_expression(cls, value: str) -> str:
+        parts = value.strip().split()
+        if len(parts) != 5:
+            raise ValueError("backup_cron_expression must have exactly 5 fields (minute hour day month day_of_week)")
+        return value.strip()

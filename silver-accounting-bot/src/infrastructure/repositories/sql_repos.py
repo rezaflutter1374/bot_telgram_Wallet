@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -31,9 +32,11 @@ from infrastructure.db.models import (
     AuditEvent,
     BankAccount,
     FinancialPeriod,
+    InsuranceBuffer,
     JournalAccount,
     JournalEntry,
     JournalLine,
+    LedgerEntry,
     LiquidationEvent,
     MarginAccount,
     MarginSnapshot,
@@ -534,6 +537,48 @@ class SqlWalletRepo:
         wallet.settlement_balance_usd = Decimal(wallet.settlement_balance_usd) - amount_usd
         wallet.available_balance_usd = Decimal(wallet.available_balance_usd) + amount_usd
         wallet.updated_at = utcnow()
+
+    async def get_margin_account(self, user_id: int) -> dict | None:
+        session = self._session()
+        ma = await session.scalar(select(MarginAccount).where(MarginAccount.user_id == user_id))
+        if ma is None:
+            return None
+        return {c.name: getattr(ma, c.name) for c in MarginAccount.__table__.columns}
+
+    async def set_margin_mode(self, user_id: int, mode: str) -> dict:
+        session = self._session()
+        ma = await session.scalar(select(MarginAccount).where(MarginAccount.user_id == user_id))
+        if ma is None:
+            ma = MarginAccount(user_id=user_id, updated_at=utcnow())
+            session.add(ma)
+        ma.margin_mode = mode
+        ma.updated_at = utcnow()
+        await session.flush()
+        return {c.name: getattr(ma, c.name) for c in MarginAccount.__table__.columns}
+
+    async def set_leverage(self, user_id: int, leverage: Decimal) -> dict:
+        session = self._session()
+        ma = await session.scalar(select(MarginAccount).where(MarginAccount.user_id == user_id))
+        if ma is None:
+            ma = MarginAccount(user_id=user_id, updated_at=utcnow())
+            session.add(ma)
+        ma.leverage = leverage
+        ma.updated_at = utcnow()
+        await session.flush()
+        return {c.name: getattr(ma, c.name) for c in MarginAccount.__table__.columns}
+
+    async def update_margin_account(self, user_id: int, **kwargs: object) -> dict:
+        session = self._session()
+        ma = await session.scalar(select(MarginAccount).where(MarginAccount.user_id == user_id))
+        if ma is None:
+            ma = MarginAccount(user_id=user_id, updated_at=utcnow())
+            session.add(ma)
+        for key, value in kwargs.items():
+            if hasattr(ma, key):
+                setattr(ma, key, value)
+        ma.updated_at = utcnow()
+        await session.flush()
+        return {c.name: getattr(ma, c.name) for c in MarginAccount.__table__.columns}
 
 
 class SqlPriceRepo:
@@ -1261,6 +1306,75 @@ class SqlOrderRepo:
             )
         return rows
 
+    async def replace_order(
+        self,
+        order_id: int,
+        *,
+        quantity_kg: Decimal | None = None,
+        limit_price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        quote_expires_at: datetime | None = None,
+    ) -> dict:
+        session = self._session()
+        order = await session.get(Order, order_id)
+        if order is None:
+            raise RuntimeError("Order not found")
+        if Decimal(order.filled_quantity_kg) > 0:
+            raise RuntimeError("Cannot replace partially filled order")
+        if quantity_kg is not None:
+            order.quantity_kg = quantity_kg
+            order.remaining_quantity_kg = quantity_kg
+            order.notional_value_usd = (quantity_kg * Decimal(order.quoted_price)).quantize(Decimal("0.000001"))
+        if limit_price is not None:
+            order.limit_price = limit_price
+        if stop_price is not None:
+            order.stop_price = stop_price
+        if quote_expires_at is not None:
+            order.quote_expires_at = ensure_utc(quote_expires_at)
+        order.updated_at = utcnow()
+        await session.flush()
+        return self._serialize_order(order)
+
+    async def list_by_status(
+        self,
+        status: OrderStatus,
+        *,
+        side: OrderSide | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        session = self._session()
+        stmt = select(Order).where(Order.status == status.value).order_by(Order.created_at.desc()).limit(limit)
+        if side is not None:
+            stmt = stmt.where(Order.side == side.value)
+        rows = (await session.scalars(stmt)).all()
+        return [self._serialize_order(row) for row in rows]
+
+    async def list_trades_for_user(
+        self,
+        user_id: int,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        session = self._session()
+        buy_order_ids = select(Order.id).where(Order.user_id == user_id)
+        sell_order_ids = select(Order.id).where(Order.user_id == user_id)
+        rows = (
+            await session.scalars(
+                select(Trade)
+                .where(
+                    or_(
+                        Trade.buy_order_id.in_(buy_order_ids),
+                        Trade.sell_order_id.in_(sell_order_ids),
+                    )
+                )
+                .order_by(Trade.executed_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+        return [self._serialize_trade(row) for row in rows]
+
 
 class SqlPositionRepo:
     def __init__(self, uow: SqlAlchemyUnitOfWork) -> None:
@@ -1343,6 +1457,66 @@ class SqlPositionRepo:
         pos.updated_at = utcnow()
         await session.flush()
         return self._serialize_position(pos)
+
+    async def update_position(
+        self,
+        user_id: int,
+        *,
+        net_kg: Decimal,
+        avg_price_usd: Decimal,
+        realized_pnl_usd: Decimal,
+    ) -> None:
+        session = self._session()
+        pos = await session.scalar(select(Position).where(Position.user_id == user_id))
+        if pos is None:
+            pos = Position(user_id=user_id, updated_at=utcnow())
+            session.add(pos)
+            await session.flush()
+        pos.net_kg = net_kg
+        pos.avg_price_usd = avg_price_usd
+        pos.updated_at = utcnow()
+        await session.flush()
+
+    async def list_positions(
+        self,
+        *,
+        min_abs_net_kg: Decimal | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        session = self._session()
+        stmt = select(Position).order_by(Position.net_kg.desc()).limit(limit)
+        if min_abs_net_kg is not None and min_abs_net_kg > 0:
+            stmt = stmt.where(func.abs(Position.net_kg) >= min_abs_net_kg)
+        rows = (await session.scalars(stmt)).all()
+        return [self._serialize_position(row) for row in rows]
+
+    async def get_position_history(
+        self,
+        user_id: int,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        session = self._session()
+        rows = (
+            await session.scalars(
+                select(Trade)
+                .join(Order, or_(Order.id == Trade.buy_order_id, Order.id == Trade.sell_order_id))
+                .where(Order.user_id == user_id)
+                .order_by(Trade.executed_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+        return [{
+            "trade_id": t.id,
+            "match_key": t.match_key,
+            "price_usd": Decimal(t.price_usd),
+            "quantity_kg": Decimal(t.quantity_kg),
+            "buy_fee_usd": Decimal(t.buy_fee_usd),
+            "sell_fee_usd": Decimal(t.sell_fee_usd),
+            "executed_at": ensure_utc(t.executed_at),
+        } for t in rows]
 
 
 class SqlTicketRepo:
@@ -2043,6 +2217,161 @@ class SqlAuditRepo:
             for row in rows
         ]
 
+    async def add_event(
+        self,
+        actor_user_id: int | None,
+        action: str,
+        entity_type: str,
+        entity_id: str,
+        *,
+        before: dict | None = None,
+        after: dict | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        ip_address: str | None = None,
+        metadata: dict | None = None,
+        reason: str | None = None,
+    ) -> dict:
+        session = self._session()
+        now = utcnow()
+        data_payload = {"metadata": metadata or {}, "reason": reason}
+        data_json = json_dumps(data_payload)
+        before_json = json_dumps(before) if before is not None else None
+        after_json = json_dumps(after) if after is not None else None
+
+        prev = (
+            await session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.entity_type == entity_type, AuditEvent.entity_id == entity_id)
+                .order_by(AuditEvent.created_at.desc())
+                .limit(1)
+            )
+        ).first()
+        previous_hash = prev.hash if prev is not None else ""
+
+        raw = f"{previous_hash}:{actor_user_id}:{action}:{entity_type}:{entity_id}:{now.isoformat()}:{data_json}"
+        h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+        row = AuditEvent(
+            actor_user_id=actor_user_id,
+            event_type=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload=data_json,
+            previous_hash=previous_hash,
+            hash=h,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            ip_address=ip_address,
+            before_json=before_json,
+            after_json=after_json,
+            created_at=now,
+        )
+        session.add(row)
+        await session.flush()
+        return {
+            "id": row.id,
+            "hash": row.hash,
+            "previous_hash": row.previous_hash,
+            "created_at": row.created_at,
+        }
+
+    async def get_chain(self, entity_type: str, entity_id: str) -> list[dict]:
+        session = self._session()
+        rows = (
+            (
+                await session.scalars(
+                    select(AuditEvent)
+                    .where(AuditEvent.entity_type == entity_type, AuditEvent.entity_id == entity_id)
+                    .order_by(AuditEvent.created_at.asc())
+                )
+            ).all()
+        )
+        return [
+            {
+                "id": row.id,
+                "actor_user_id": row.actor_user_id,
+                "event_type": row.event_type,
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "payload": json.loads(row.payload),
+                "previous_hash": row.previous_hash,
+                "hash": row.hash,
+                "correlation_id": row.correlation_id,
+                "causation_id": row.causation_id,
+                "ip_address": row.ip_address,
+                "before": json.loads(row.before_json) if row.before_json else None,
+                "after": json.loads(row.after_json) if row.after_json else None,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    async def verify_chain(self, entity_type: str, entity_id: str) -> bool:
+        session = self._session()
+        rows = (
+            (
+                await session.scalars(
+                    select(AuditEvent)
+                    .where(AuditEvent.entity_type == entity_type, AuditEvent.entity_id == entity_id)
+                    .order_by(AuditEvent.created_at.asc())
+                )
+            ).all()
+        )
+        expected_prev = ""
+        for row in rows:
+            if row.previous_hash != expected_prev:
+                return False
+            data_payload = json.loads(row.payload) if row.payload else {}
+            data_json = json_dumps(data_payload)
+            raw = f"{expected_prev}:{row.actor_user_id}:{row.event_type}:{row.entity_type}:{row.entity_id}:{row.created_at.isoformat()}:{data_json}"
+            expected_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if row.hash != expected_hash:
+                return False
+            expected_prev = row.hash
+        return True
+
+    async def search_audit(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        event_type: str | None = None,
+        entity_type: str | None = None,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+    ) -> list[dict]:
+        session = self._session()
+        stmt = select(AuditEvent).order_by(AuditEvent.created_at.desc()).offset(offset).limit(limit)
+        if event_type is not None:
+            stmt = stmt.where(AuditEvent.event_type == event_type)
+        if entity_type is not None:
+            stmt = stmt.where(AuditEvent.entity_type == entity_type)
+        if date_from is not None:
+            stmt = stmt.where(AuditEvent.created_at >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(AuditEvent.created_at <= date_to)
+        rows = (await session.scalars(stmt)).all()
+        return [
+            {
+                "id": row.id,
+                "actor_user_id": row.actor_user_id,
+                "event_type": row.event_type,
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "payload": json.loads(row.payload),
+                "previous_hash": row.previous_hash,
+                "hash": row.hash,
+                "correlation_id": row.correlation_id,
+                "causation_id": row.causation_id,
+                "ip_address": row.ip_address,
+                "before": json.loads(row.before_json) if row.before_json else None,
+                "after": json.loads(row.after_json) if row.after_json else None,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
 
 class SqlNotificationRepo:
     def __init__(self, uow: SqlAlchemyUnitOfWork) -> None:
@@ -2511,3 +2840,233 @@ class SqlBackupRepo:
                 normalized.append({k: self._deserialize_value(table.c[k], v) for k, v in r.items() if k in table.c})
             if normalized:
                 await session.execute(table.insert(), normalized)
+
+
+class SqlLedgerRepo:
+    def __init__(self, uow: SqlAlchemyUnitOfWork) -> None:
+        self._uow = uow
+
+    def _session(self):
+        if self._uow.session is None:
+            raise RuntimeError("No active transaction")
+        return self._uow.session
+
+    async def ensure_accounts(self, accounts: list[dict]) -> None:
+        session = self._session()
+        existing = (await session.scalars(select(JournalAccount))).all()
+        existing_codes = {a.code for a in existing}
+        for acct in accounts:
+            if acct["code"] not in existing_codes:
+                session.add(JournalAccount(
+                    code=acct["code"],
+                    name=acct["name"],
+                    account_type=acct["account_type"],
+                    parent_id=None,
+                    is_active=True,
+                    created_at=utcnow(),
+                ))
+        await session.flush()
+
+    async def post_entry(
+        self,
+        reference: str,
+        description: str,
+        entry_type: str,
+        lines: list[dict],
+        created_by_user_id: int | None = None,
+        posted_at: datetime | None = None,
+        correlation_id: str | None = None,
+    ) -> dict:
+        session = self._session()
+        debit = sum(Decimal(str(l.get("debit_usd", 0))) for l in lines)
+        credit = sum(Decimal(str(l.get("credit_usd", 0))) for l in lines)
+        if debit != credit:
+            raise RuntimeError(f"Unbalanced ledger entry: debit={debit}, credit={credit}")
+        entry = JournalEntry(
+            reference=reference,
+            description=description,
+            posted_at=ensure_utc(posted_at or utcnow()),
+            created_by_user_id=created_by_user_id,
+            created_at=utcnow(),
+        )
+        session.add(entry)
+        await session.flush()
+        for l in lines:
+            account = await session.scalar(select(JournalAccount).where(JournalAccount.code == l["account_code"]))
+            if account is None:
+                raise RuntimeError(f"Ledger account {l['account_code']} not found")
+            session.add(JournalLine(
+                entry_id=entry.id,
+                account_id=account.id,
+                user_id=l.get("user_id"),
+                debit_usd=Decimal(str(l.get("debit_usd", 0))),
+                credit_usd=Decimal(str(l.get("credit_usd", 0))),
+                created_at=utcnow(),
+            ))
+        if correlation_id:
+            session.add(LedgerEntry(
+                user_id=created_by_user_id,
+                entry_type=entry_type,
+                amount_usd=debit,
+                description=description,
+                reference=reference,
+                created_at=utcnow(),
+            ))
+        await session.flush()
+        return {"id": entry.id, "reference": reference}
+
+    async def get_entry(self, entry_id: int) -> dict | None:
+        session = self._session()
+        row = await session.get(JournalEntry, entry_id)
+        if row is None:
+            return None
+        return {"id": row.id, "reference": row.reference, "description": row.description,
+                "posted_at": row.posted_at, "created_by_user_id": row.created_by_user_id,
+                "created_at": row.created_at}
+
+    async def get_entry_by_reference(self, reference: str) -> dict | None:
+        session = self._session()
+        row = await session.scalar(select(JournalEntry).where(JournalEntry.reference == reference))
+        if row is None:
+            return None
+        return {"id": row.id, "reference": row.reference, "description": row.description,
+                "posted_at": row.posted_at, "created_by_user_id": row.created_by_user_id,
+                "created_at": row.created_at}
+
+    async def list_entries(
+        self,
+        *,
+        entry_type: str | None = None,
+        user_id: int | None = None,
+        from_dt: datetime | None = None,
+        to_dt: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        session = self._session()
+        stmt = select(JournalEntry).order_by(JournalEntry.posted_at.desc()).offset(offset).limit(limit)
+        if from_dt is not None:
+            stmt = stmt.where(JournalEntry.posted_at >= ensure_utc(from_dt))
+        if to_dt is not None:
+            stmt = stmt.where(JournalEntry.posted_at <= ensure_utc(to_dt))
+        rows = (await session.scalars(stmt)).all()
+        return [{"id": r.id, "reference": r.reference, "description": r.description,
+                  "posted_at": r.posted_at, "created_by_user_id": r.created_by_user_id,
+                  "created_at": r.created_at} for r in rows]
+
+    async def account_balance(self, account_code: str, at_dt: datetime | None = None) -> Decimal:
+        session = self._session()
+        account = await session.scalar(select(JournalAccount).where(JournalAccount.code == account_code))
+        if account is None:
+            return Decimal("0")
+        q = select(
+            func.coalesce(func.sum(JournalLine.debit_usd), 0),
+            func.coalesce(func.sum(JournalLine.credit_usd), 0),
+        ).join(JournalEntry, JournalEntry.id == JournalLine.entry_id).where(JournalLine.account_id == account.id)
+        if at_dt is not None:
+            q = q.where(JournalEntry.posted_at <= ensure_utc(at_dt))
+        row = (await session.execute(q)).one()
+        return (Decimal(row[0]) - Decimal(row[1])).quantize(Decimal("0.01"))
+
+    async def list_accounts(self) -> list[dict]:
+        session = self._session()
+        rows = (await session.scalars(select(JournalAccount).order_by(JournalAccount.code.asc()))).all()
+        return [{"id": r.id, "code": r.code, "name": r.name,
+                  "account_type": _as_account_type(r.account_type),
+                  "parent_id": r.parent_id, "is_active": bool(r.is_active)} for r in rows]
+
+
+class SqlLiquidationRepo:
+    def __init__(self, uow: SqlAlchemyUnitOfWork) -> None:
+        self._uow = uow
+
+    def _session(self):
+        if self._uow.session is None:
+            raise RuntimeError("No active transaction")
+        return self._uow.session
+
+    async def create_event(
+        self,
+        user_id: int,
+        margin_ratio: Decimal,
+        critical_level: Decimal,
+        status: str,
+    ) -> dict:
+        session = self._session()
+        row = LiquidationEvent(
+            user_id=user_id,
+            margin_ratio=margin_ratio,
+            critical_level=critical_level,
+            status=status,
+            created_at=utcnow(),
+        )
+        session.add(row)
+        await session.flush()
+        return {"id": row.id, "user_id": row.user_id, "margin_ratio": Decimal(row.margin_ratio),
+                "status": row.status, "created_at": row.created_at}
+
+    async def get_event(self, event_id: int) -> dict | None:
+        session = self._session()
+        row = await session.get(LiquidationEvent, event_id)
+        if row is None:
+            return None
+        return {"id": row.id, "user_id": row.user_id, "margin_ratio": Decimal(row.margin_ratio),
+                "critical_level": Decimal(row.critical_level),
+                "close_price_usd": Decimal(row.close_price_usd) if row.close_price_usd else None,
+                "status": row.status, "created_at": row.created_at, "completed_at": row.completed_at}
+
+    async def list_events(self, user_id: int | None = None, status: str | None = None, limit: int = 50) -> list[dict]:
+        session = self._session()
+        stmt = select(LiquidationEvent).order_by(LiquidationEvent.created_at.desc()).limit(limit)
+        if user_id is not None:
+            stmt = stmt.where(LiquidationEvent.user_id == user_id)
+        if status is not None:
+            stmt = stmt.where(LiquidationEvent.status == status)
+        rows = (await session.scalars(stmt)).all()
+        return [{"id": r.id, "user_id": r.user_id, "margin_ratio": Decimal(r.margin_ratio),
+                  "critical_level": Decimal(r.critical_level),
+                  "close_price_usd": Decimal(r.close_price_usd) if r.close_price_usd else None,
+                  "status": r.status, "created_at": r.created_at, "completed_at": r.completed_at} for r in rows]
+
+    async def update_status(self, event_id: int, status: str, close_price_usd: Decimal | None = None) -> dict:
+        session = self._session()
+        row = await session.get(LiquidationEvent, event_id)
+        if row is None:
+            raise RuntimeError("Liquidation event not found")
+        row.status = status
+        if close_price_usd is not None:
+            row.close_price_usd = close_price_usd
+        if status == "completed":
+            row.completed_at = utcnow()
+        await session.flush()
+        return {"id": row.id, "user_id": row.user_id, "status": row.status}
+
+    async def get_insurance_balance(self) -> Decimal:
+        session = self._session()
+        debit = await session.scalar(
+            select(func.coalesce(func.sum(InsuranceBuffer.amount_usd), 0)).where(InsuranceBuffer.amount_usd > 0)
+        )
+        credit = await session.scalar(
+            select(func.coalesce(func.sum(InsuranceBuffer.amount_usd), 0)).where(InsuranceBuffer.amount_usd < 0)
+        )
+        return (Decimal(debit or 0) + Decimal(credit or 0)).quantize(Decimal("0.01"))
+
+    async def debit_insurance(self, amount_usd: Decimal, reason: str) -> None:
+        session = self._session()
+        session.add(InsuranceBuffer(
+            amount_usd=-amount_usd,
+            reason=reason,
+            payload_json=json.dumps({"debit": str(amount_usd), "reason": reason}),
+            created_at=utcnow(),
+        ))
+        await session.flush()
+
+    async def credit_insurance(self, amount_usd: Decimal, reason: str) -> None:
+        session = self._session()
+        session.add(InsuranceBuffer(
+            amount_usd=amount_usd,
+            reason=reason,
+            payload_json=json.dumps({"credit": str(amount_usd), "reason": reason}),
+            created_at=utcnow(),
+        ))
+        await session.flush()

@@ -14,7 +14,9 @@ from core.logging import configure_logging
 from core.settings import Settings
 from domain.enums import LiquidationStatus, MarginCallStatus, NotificationStatus
 from domain.services.margin import MarginCalculator
-from infrastructure.db.models import JournalAccount, JournalEntry, JournalLine, LiquidationEvent, MarginCall, Notification, Position, Price, User, Wallet
+from domain.services.margin_engine import MarginEngine
+from domain.services.liquidation_engine import LiquidationEngine, LiquidationOrder
+from infrastructure.db.models import InsuranceBuffer, JournalAccount, JournalEntry, JournalLine, LiquidationEvent, MarginAccount, MarginCall, Notification, Position, Price, User, Wallet
 from infrastructure.settlement.engine import run_daily_settlement
 
 logger = logging.getLogger("worker")
@@ -202,25 +204,31 @@ async def monitor_margin_calls(ctx: dict) -> dict:
             current = Decimal(price.sell_price)
             rows = (
                 await session.execute(
-                    select(Wallet, Position)
+                    select(Wallet, Position, MarginAccount)
                     .join(Position, Position.user_id == Wallet.user_id)
+                    .outerjoin(MarginAccount, MarginAccount.user_id == Wallet.user_id)
                     .limit(settings.wallet_scan_batch_size)
                 )
             ).all()
             calc = MarginCalculator(Decimal("100"), settings.margin_call_threshold_ratio, warning_ratio_threshold=settings.margin_warning_ratio, liquidation_ratio_threshold=settings.margin_liquidation_critical_ratio)
-            for w, pos in rows:
+            margin_engine = MarginEngine(calc)
+            for w, pos, ma in rows:
                 net_kg = Decimal(pos.net_kg)
                 exposure = abs(net_kg)
                 if exposure == 0:
                     continue
-                floating = (current - Decimal(pos.avg_price_usd)) * net_kg
-                snap = calc.snapshot(
-                    available_balance_usd=Decimal(w.available_balance_usd),
-                    frozen_balance_usd=Decimal(w.frozen_balance_usd),
-                    floating_pnl_usd=floating,
-                    exposure_kg=exposure,
+                equity = Decimal(w.available_balance_usd) + Decimal(w.frozen_balance_usd) + Decimal(w.margin_balance_usd)
+                if ma and ma.leverage:
+                    lev = Decimal(ma.leverage)
+                else:
+                    lev = Decimal("1")
+                margin_req = margin_engine.calculate_requirements(
+                    position_value=exposure * current,
+                    equity_usd=equity,
+                    leverage=lev,
+                    margin_mode=str(ma.margin_mode) if ma else "cross",
                 )
-                if snap.margin_ratio < settings.margin_call_threshold_ratio:
+                if margin_engine.is_margin_call(margin_req.margin_ratio, settings.margin_call_threshold_ratio):
                     existing = await session.scalar(
                         select(MarginCall).where(MarginCall.user_id == w.user_id, MarginCall.status == MarginCallStatus.open.value)
                     )
@@ -228,7 +236,7 @@ async def monitor_margin_calls(ctx: dict) -> dict:
                         session.add(
                             MarginCall(
                                 user_id=w.user_id,
-                                margin_ratio=snap.margin_ratio,
+                                margin_ratio=margin_req.margin_ratio,
                                 threshold=settings.margin_call_threshold_ratio,
                                 status=MarginCallStatus.open.value,
                                 created_at=datetime.now(timezone.utc),
@@ -239,7 +247,7 @@ async def monitor_margin_calls(ctx: dict) -> dict:
                                 user_id=w.user_id,
                                 channel="telegram",
                                 kind="margin_call",
-                                payload=f'{{"margin_ratio":"{snap.margin_ratio}","threshold":"{settings.margin_call_threshold_ratio}"}}',
+                                payload=f'{{"margin_ratio":"{margin_req.margin_ratio}","threshold":"{settings.margin_call_threshold_ratio}"}}',
                                 status=NotificationStatus.pending.value,
                                 created_at=datetime.now(timezone.utc),
                             )
@@ -265,75 +273,110 @@ async def monitor_liquidations(ctx: dict) -> dict:
             current = Decimal(price.sell_price)
             rows = (
                 await session.execute(
-                    select(Wallet, Position)
+                    select(Wallet, Position, MarginAccount)
                     .join(Position, Position.user_id == Wallet.user_id)
+                    .outerjoin(MarginAccount, MarginAccount.user_id == Wallet.user_id)
                     .limit(settings.wallet_scan_batch_size)
                 )
             ).all()
             calc = MarginCalculator(Decimal("100"), settings.margin_call_threshold_ratio, warning_ratio_threshold=settings.margin_warning_ratio, liquidation_ratio_threshold=critical)
+            margin_engine = MarginEngine(calc)
+            liquidation_engine = LiquidationEngine()
             customer = await session.scalar(select(JournalAccount).where(JournalAccount.code == "2000"))
             income = await session.scalar(select(JournalAccount).where(JournalAccount.code == "4000"))
             expense = await session.scalar(select(JournalAccount).where(JournalAccount.code == "5000"))
-            for w, pos in rows:
+            candidate_orders = []
+            for w, pos, ma in rows:
                 net_kg = Decimal(pos.net_kg)
                 exposure = abs(net_kg)
                 if exposure == 0:
                     continue
-                floating = (current - Decimal(pos.avg_price_usd)) * net_kg
-                snap = calc.snapshot(
-                    available_balance_usd=Decimal(w.available_balance_usd),
-                    frozen_balance_usd=Decimal(w.frozen_balance_usd),
-                    floating_pnl_usd=floating,
-                    exposure_kg=exposure,
+                equity = Decimal(w.available_balance_usd) + Decimal(w.frozen_balance_usd) + Decimal(w.margin_balance_usd)
+                if ma and ma.leverage:
+                    lev = Decimal(ma.leverage)
+                else:
+                    lev = Decimal("1")
+                margin_req = margin_engine.calculate_requirements(
+                    position_value=exposure * current,
+                    equity_usd=equity,
+                    leverage=lev,
+                    margin_mode=str(ma.margin_mode) if ma else "cross",
                 )
-                if snap.margin_ratio <= critical:
-                    if customer is None or income is None or expense is None:
-                        raise RuntimeError("Accounting chart not ready")
-                    session.add(
-                        LiquidationEvent(
-                            user_id=w.user_id,
-                            margin_ratio=snap.margin_ratio,
-                            critical_level=critical,
-                            close_price_usd=current,
-                            status=LiquidationStatus.completed.value,
-                            created_at=datetime.now(timezone.utc),
-                            completed_at=datetime.now(timezone.utc),
-                        )
+                if liquidation_engine.check_liquidation_trigger(margin_req.margin_ratio, critical):
+                    candidate_orders.append(LiquidationOrder(
+                        user_id=w.user_id,
+                        position_net_kg=net_kg,
+                        avg_price_usd=Decimal(pos.avg_price_usd),
+                        margin_ratio=margin_req.margin_ratio,
+                        mark_price_usd=current,
+                        created_at=datetime.now(timezone.utc),
+                    ))
+            if not candidate_orders:
+                return {"liquidated": 0, "reason": "no_candidates"}
+            prioritized = liquidation_engine.prioritize(candidate_orders, strategy="highest_leverage")
+            insurance_balance = Decimal("0")
+            ins_buffer = await session.scalar(select(InsuranceBuffer).where(InsuranceBuffer.id == 1))
+            if ins_buffer:
+                insurance_balance = Decimal(ins_buffer.balance_usd)
+            for lq in prioritized[:10]:
+                if customer is None or income is None or expense is None:
+                    raise RuntimeError("Accounting chart not ready")
+                result = liquidation_engine.execute_liquidation(lq, insurance_balance, max_close_ratio=Decimal("1"))
+                wallet_row = await session.scalar(select(Wallet).where(Wallet.user_id == lq.user_id))
+                if wallet_row is None:
+                    continue
+                realized = result.pnl_usd
+                wallet_row.available_balance_usd = Decimal(wallet_row.available_balance_usd) + realized
+                wallet_row.updated_at = datetime.now(timezone.utc)
+                session.add(
+                    LiquidationEvent(
+                        user_id=lq.user_id,
+                        margin_ratio=lq.margin_ratio,
+                        critical_level=critical,
+                        close_price_usd=result.close_price_usd,
+                        status=LiquidationStatus.completed.value,
+                        created_at=datetime.now(timezone.utc),
+                        completed_at=datetime.now(timezone.utc),
                     )
-                    realized = (current - Decimal(pos.avg_price_usd)) * net_kg
-                    w.available_balance_usd = Decimal(w.available_balance_usd) + realized
-                    w.updated_at = datetime.now(timezone.utc)
-                    amt = abs(realized).quantize(Decimal("0.01"))
-                    if amt > 0:
-                        entry = JournalEntry(
-                            reference=f"liquidation:{w.user_id}:{datetime.now(timezone.utc).date().isoformat()}",
-                            description="Auto liquidation PnL",
-                            posted_at=datetime.now(timezone.utc),
-                            created_by_user_id=None,
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        session.add(entry)
-                        await session.flush()
-                        if realized > 0:
-                            session.add(JournalLine(entry_id=entry.id, account_id=expense.id, user_id=None, debit_usd=amt, credit_usd=Decimal("0"), created_at=datetime.now(timezone.utc)))
-                            session.add(JournalLine(entry_id=entry.id, account_id=customer.id, user_id=w.user_id, debit_usd=Decimal("0"), credit_usd=amt, created_at=datetime.now(timezone.utc)))
-                        else:
-                            session.add(JournalLine(entry_id=entry.id, account_id=customer.id, user_id=w.user_id, debit_usd=amt, credit_usd=Decimal("0"), created_at=datetime.now(timezone.utc)))
-                            session.add(JournalLine(entry_id=entry.id, account_id=income.id, user_id=None, debit_usd=Decimal("0"), credit_usd=amt, created_at=datetime.now(timezone.utc)))
-                    pos.net_kg = Decimal("0")
-                    pos.avg_price_usd = Decimal("0")
-                    pos.updated_at = datetime.now(timezone.utc)
-                    session.add(
-                        Notification(
-                            user_id=w.user_id,
-                            channel="telegram",
-                            kind="liquidation",
-                            payload=f'{{"price":"{current}","pnl":"{realized}"}}',
-                            status=NotificationStatus.pending.value,
-                            created_at=datetime.now(timezone.utc),
-                        )
+                )
+                amt = abs(realized).quantize(Decimal("0.01"))
+                if amt > 0:
+                    entry = JournalEntry(
+                        reference=f"liquidation:{lq.user_id}:{datetime.now(timezone.utc).date().isoformat()}",
+                        description="Auto liquidation PnL",
+                        posted_at=datetime.now(timezone.utc),
+                        created_by_user_id=None,
+                        created_at=datetime.now(timezone.utc),
                     )
-                    liquidated += 1
+                    session.add(entry)
+                    await session.flush()
+                    if realized > 0:
+                        session.add(JournalLine(entry_id=entry.id, account_id=expense.id, user_id=None, debit_usd=amt, credit_usd=Decimal("0"), created_at=datetime.now(timezone.utc)))
+                        session.add(JournalLine(entry_id=entry.id, account_id=customer.id, user_id=lq.user_id, debit_usd=Decimal("0"), credit_usd=amt, created_at=datetime.now(timezone.utc)))
+                    else:
+                        session.add(JournalLine(entry_id=entry.id, account_id=customer.id, user_id=lq.user_id, debit_usd=amt, credit_usd=Decimal("0"), created_at=datetime.now(timezone.utc)))
+                        session.add(JournalLine(entry_id=entry.id, account_id=income.id, user_id=None, debit_usd=Decimal("0"), credit_usd=amt, created_at=datetime.now(timezone.utc)))
+                pos_row = await session.scalar(select(Position).where(Position.user_id == lq.user_id))
+                if pos_row:
+                    pos_row.net_kg = Decimal("0")
+                    pos_row.avg_price_usd = Decimal("0")
+                    pos_row.updated_at = datetime.now(timezone.utc)
+                if result.insurance_used_usd > 0 and ins_buffer:
+                    ins_buffer.balance_usd = Decimal(ins_buffer.balance_usd) - result.insurance_used_usd
+                    if ins_buffer.balance_usd < 0:
+                        ins_buffer.balance_usd = Decimal("0")
+                    insurance_balance = Decimal(ins_buffer.balance_usd)
+                session.add(
+                    Notification(
+                        user_id=lq.user_id,
+                        channel="telegram",
+                        kind="liquidation",
+                        payload=f'{{"price":"{result.close_price_usd}","pnl":"{realized}"}}',
+                        status=NotificationStatus.pending.value,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                )
+                liquidated += 1
     return {"liquidated": liquidated}
 
 

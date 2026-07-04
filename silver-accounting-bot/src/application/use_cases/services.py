@@ -31,6 +31,8 @@ from application.ports.repositories.risk_calc_repo import RiskCalcRepo
 from application.ports.settlement_engine import SettlementEngine
 from application.ports.repositories.backup_repo import BackupRepo
 from application.ports.repositories.accounting_repo import AccountingRepo
+from application.ports.repositories.ledger_repo import LedgerRepo
+from application.ports.repositories.liquidation_repo import LiquidationRepo
 from application.ports.repositories.audit_repo import AuditRepo
 from application.ports.repositories.notification_repo import NotificationRepo
 from application.ports.repositories.order_repo import OrderRepo
@@ -63,20 +65,33 @@ from domain.event_bus import EventBus
 from domain.events import (
     DomainEvent,
     FinancialPeriodClosed,
+    FundingExecuted,
+    InsuranceUsed,
     KycStatusChanged,
+    LedgerEntryPosted,
+    LiquidationCompleted,
+    MarginTransferExecuted,
     OrderCreated,
     OrderFilled,
+    OrderReplaced,
     OrderSettled,
     PaymentApproved,
     PaymentRejected,
     PriceUpdated,
+    RiskAlertTriggered,
     SettlementExecuted,
     SettlementRolledBack,
     TradeExecuted,
 )
 from infrastructure.event_bus.store import EventStore
 from domain.services.arbitration import ArbitrationHandler, ArbitrationReason, ArbitrationStatus
+from domain.services.ledger import LedgerService
 from domain.services.margin import MarginCalculator
+from domain.services.margin_engine import MarginEngine
+from domain.services.matching_engine import MatchingEngine
+from domain.services.position_engine import PositionEngine
+from domain.services.risk_engine import RiskEngine
+from domain.services.liquidation_engine import LiquidationEngine, LiquidationOrder
 from domain.services.rule_engine import BusinessRuleEngine, OrderValidationRequest
 
 
@@ -109,6 +124,14 @@ class AppServices:
         event_bus: EventBus | None = None,
         event_store: EventStore | None = None,
         payment_reconciliation: PaymentReconciliationRepo | None = None,
+        ledger_repo: LedgerRepo | None = None,
+        liquidation_repo: LiquidationRepo | None = None,
+        matching_engine: MatchingEngine | None = None,
+        ledger_service: LedgerService | None = None,
+        position_engine: PositionEngine | None = None,
+        margin_engine: MarginEngine | None = None,
+        risk_engine: RiskEngine | None = None,
+        liquidation_engine: LiquidationEngine | None = None,
     ) -> None:
         self._uow = uow
         self._users = users
@@ -136,6 +159,14 @@ class AppServices:
         self._event_bus = event_bus
         self._event_store = event_store
         self._payment_reconciliation = payment_reconciliation
+        self._ledger_repo = ledger_repo
+        self._liquidation_repo = liquidation_repo
+        self._matching_engine = matching_engine or MatchingEngine()
+        self._ledger_service = ledger_service or LedgerService()
+        self._position_engine = position_engine or PositionEngine()
+        self._margin_engine = margin_engine or MarginEngine(margin_calculator)
+        self._risk_engine = risk_engine or RiskEngine()
+        self._liquidation_engine = liquidation_engine or LiquidationEngine()
 
     async def _publish(self, event: DomainEvent) -> None:
         if self._event_store is not None:
@@ -902,6 +933,7 @@ class AppServices:
 
     async def review_payment_request(self, actor_user_id: int, payment_id: int, approve: bool, note: str | None) -> PaymentDTO:
         async with self._uow.transaction():
+            
             permission = "approve_payments" if approve else "reject_payments"
             allowed = await self._roles.user_has_permission(actor_user_id, permission)
             if not allowed:
@@ -1920,3 +1952,373 @@ class AppServices:
             return {"cleaned": 0, "skipped": "cleanup not configured"}
         async with self._uow.transaction():
             return await self._cleanup.purge_old_records(retention_days)
+
+    # ── Phase 2: Matching Engine Integration ──────────────────────
+
+    async def replace_order(
+        self,
+        user_id: int,
+        order_id: int,
+        *,
+        quantity_kg: Decimal | None = None,
+        limit_price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+    ) -> OrderDTO:
+        async with self._uow.transaction():
+            order = await self._orders.get(order_id)
+            if order is None:
+                raise NotFound("Order not found")
+            if order["user_id"] != user_id:
+                raise Forbidden("Not allowed")
+            replacement_ok, reason = self._matching_engine.can_replace_order(order)
+            if not replacement_ok:
+                raise ValidationError(reason)
+            updates: dict[str, object] = {}
+            if quantity_kg is not None:
+                updates["quantity_kg"] = quantity_kg
+            if limit_price is not None:
+                updates["quoted_price"] = limit_price
+                updates["limit_price"] = limit_price
+            if stop_price is not None:
+                updates["stop_price"] = stop_price
+            updated = await self._orders.replace_order(order_id, **updates)
+            if quantity_kg is not None and quantity_kg > Decimal(order.get("filled_quantity_kg", "0")):
+                remaining = quantity_kg - Decimal(order.get("filled_quantity_kg", "0"))
+                price_row = await self._prices.get_latest()
+                if price_row is not None:
+                    current_price = Decimal(price_row["buy_price"]) if order["side"] == OrderSide.buy else Decimal(price_row["sell_price"])
+                    exposure = await self.calculate_user_exposure(user_id)
+                    net_kg = Decimal(exposure.get("net_kg", "0"))
+                    new_exposure = (net_kg + remaining) if order["side"] == OrderSide.buy else (net_kg - remaining)
+                    margin_req = self._margin_engine.calculate_requirements(
+                        position_value=abs(new_exposure) * current_price,
+                        equity_usd=Decimal(exposure.get("equity_usd", "0")),
+                        leverage=Decimal(exposure.get("leverage", "1")),
+                        margin_mode="cross",
+                    )
+                    if not self._margin_engine.validate_margin_sufficient(margin_req, Decimal(order.get("reserved_margin_usd", "0")) + Decimal(order.get("reserved_balance_usd", "0"))):
+                        raise InsufficientDeposit("Insufficient margin for increased quantity")
+            await self._publish(OrderReplaced(
+                aggregate_id=str(order_id),
+                aggregate_type="order",
+                actor_user_id=user_id,
+                payload={"order_id": order_id, **updates},
+            ))
+            return OrderDTO(**updated)
+
+    # ── Phase 3: Position Engine Integration ──────────────────────
+
+    async def get_position_pnl(self, user_id: int) -> dict:
+        async with self._uow.transaction():
+            pos = await self._positions.get_position(user_id)
+            if pos is None:
+                return {"user_id": user_id, "net_kg": 0, "realized_pnl_usd": 0, "unrealized_pnl_usd": 0}
+            price_row = await self._prices.get_latest()
+            mark_price = Decimal(price_row["sell_price"]) if price_row else Decimal("0")
+            pnl = self._position_engine.calculate_pnl_at_price(
+                net_kg=Decimal(pos["net_kg"]),
+                avg_price=Decimal(pos["avg_price_usd"]),
+                current_price=mark_price,
+            )
+            return {
+                "user_id": user_id,
+                "net_kg": pos["net_kg"],
+                "avg_price_usd": pos["avg_price_usd"],
+                "realized_pnl_usd": pos.get("realized_pnl_usd", Decimal("0")),
+                "unrealized_pnl_usd": pnl.total.quantize(Decimal("0.01")),
+                "mark_price_usd": mark_price,
+                "position_value_usd": self._position_engine.position_value(Decimal(pos["net_kg"]), mark_price).quantize(Decimal("0.01")),
+            }
+
+    async def get_unrealized_pnl(self, user_id: int) -> Decimal:
+        async with self._uow.transaction():
+            pos = await self._positions.get_position(user_id)
+            if pos is None:
+                return Decimal("0")
+            price_row = await self._prices.get_latest()
+            current_price = Decimal(price_row["sell_price"]) if price_row else Decimal("0")
+            return self._position_engine.calculate_unrealized_pnl(
+                net_kg=Decimal(pos["net_kg"]),
+                avg_price=Decimal(pos["avg_price_usd"]),
+                current_price=current_price,
+            )
+
+    async def get_position_history(self, user_id: int, limit: int = 50) -> list[dict]:
+        async with self._uow.transaction():
+            return await self._positions.get_position_history(user_id, limit=limit)
+
+    # ── Phase 4: Margin Engine Integration ────────────────────────
+
+    async def margin_transfer(self, user_id: int, amount_usd: Decimal, *, from_wallet: bool = True) -> dict:
+        if amount_usd <= 0:
+            raise ValidationError("Amount must be > 0")
+        async with self._uow.transaction():
+            wallet = await self._wallets.get_wallet(user_id)
+            if wallet is None:
+                raise NotFound("Wallet not found")
+            margin_account = await self._wallets.get_margin_account(user_id)
+            if from_wallet:
+                if Decimal(wallet["available_balance_usd"]) < amount_usd:
+                    raise InsufficientDeposit("Insufficient available balance")
+                await self._wallets.transfer_available_to_margin(user_id, amount_usd)
+            else:
+                if Decimal(margin_account.get("free_margin_usd", "0")) < amount_usd if margin_account else 0:
+                    raise InsufficientDeposit("Insufficient free margin")
+                await self._wallets.release_margin_to_available(user_id, amount_usd)
+            await self._publish(MarginTransferExecuted(
+                aggregate_id=str(user_id),
+                aggregate_type="user",
+                actor_user_id=user_id,
+                payload={"amount_usd": str(amount_usd), "from_wallet": from_wallet},
+            ))
+            return {"user_id": user_id, "amount_usd": amount_usd, "from_wallet": from_wallet}
+
+    async def set_margin_mode(self, user_id: int, mode: str) -> dict:
+        if mode not in ("cross", "isolated"):
+            raise ValidationError("Margin mode must be 'cross' or 'isolated'")
+        async with self._uow.transaction():
+            existing = await self._wallets.set_margin_mode(user_id, mode)
+            return {"user_id": user_id, "margin_mode": mode}
+
+    async def set_leverage(self, user_id: int, leverage: Decimal) -> dict:
+        if leverage < 1 or leverage > 100:
+            raise ValidationError("Leverage must be between 1 and 100")
+        async with self._uow.transaction():
+            existing = await self._wallets.set_leverage(user_id, leverage)
+            return {"user_id": user_id, "leverage": leverage}
+
+    async def collect_funding_fees(self) -> dict:
+        rate = Decimal("0.0001")
+        async with self._uow.transaction():
+            price_row = await self._prices.get_latest()
+            if price_row is None:
+                return {"collected": 0, "reason": "no_price"}
+            mark_price = Decimal(price_row["sell_price"])
+            positions = await self._positions.list_positions(limit=500)
+            collected = 0
+            for pos in positions:
+                net_kg = Decimal(pos["net_kg"])
+                if net_kg == 0:
+                    continue
+                funding = self._margin_engine.calculate_funding_fee(net_kg, mark_price, rate)
+                if funding <= 0:
+                    continue
+                wallet = await self._wallets.get_wallet(pos["user_id"])
+                if wallet and Decimal(wallet["available_balance_usd"]) >= funding:
+                    await self._wallets.freeze(pos["user_id"], funding)
+                    await self._publish(FundingExecuted(
+                        aggregate_id=str(pos["user_id"]),
+                        aggregate_type="user",
+                        actor_user_id=pos["user_id"],
+                        payload={"funding_usd": str(funding), "rate": str(rate)},
+                    ))
+                    collected += 1
+            return {"collected": collected, "rate": str(rate)}
+
+    # ── Phase 5: Risk Engine Integration ──────────────────────────
+
+    async def evaluate_risk_limits(self, user_id: int) -> dict:
+        async with self._uow.transaction():
+            exposure = await self.calculate_user_exposure(user_id)
+            net_kg = Decimal(exposure.get("net_kg", "0"))
+            price_row = await self._prices.get_latest()
+            mark_price = Decimal(price_row["sell_price"]) if price_row else Decimal("0")
+            pos = await self._positions.get_position(user_id)
+            violations = await self._risk.list_violations(user_id, limit=10)
+            open_violations = [v for v in violations if v.get("status", "").lower() == "open"]
+            wallet = await self._wallets.get_wallet(user_id)
+            equity = Decimal("0")
+            if wallet:
+                equity = Decimal(wallet["available_balance_usd"]) + Decimal(wallet["frozen_balance_usd"]) + Decimal(wallet["margin_balance_usd"])
+            risk_snapshot = self._risk_engine.build_snapshot(
+                user_id=user_id,
+                net_kg=net_kg,
+                avg_price=Decimal(pos["avg_price_usd"] if pos else "0"),
+                mark_price=mark_price,
+                equity=equity,
+                open_violations=len(open_violations),
+            )
+            limits = [
+                self._risk_engine.check_position_limit(risk_snapshot, max_kg=Decimal("50000")),
+                self._risk_engine.check_exposure_limit(risk_snapshot, max_exposure_kg=Decimal("100000")),
+                self._risk_engine.check_leverage_limit(risk_snapshot, max_leverage=Decimal("10")),
+                self._risk_engine.check_daily_loss_limit(risk_snapshot, max_daily_loss_usd=Decimal("50000")),
+                self._risk_engine.check_volume_limit(risk_snapshot, max_volume_kg=Decimal("100000")),
+                self._risk_engine.check_max_drawdown(risk_snapshot, max_drawdown_pct=Decimal("0.5")),
+                self._risk_engine.check_concentration(risk_snapshot, max_pct=Decimal("0.8")),
+            ]
+            failed = [r for r in limits if not r.passed]
+            if failed:
+                for r in failed:
+                    await self._risk.create_violation(
+                        user_id=user_id,
+                        order_id=None,
+                        severity=r.severity.value,
+                        violation_type=r.limit_type.value,
+                        message=r.message,
+                        payload={"limit_value": str(r.limit_value), "current_value": str(r.current_value)},
+                    )
+                await self._publish(RiskAlertTriggered(
+                    aggregate_id=str(user_id),
+                    aggregate_type="user",
+                    actor_user_id=None,
+                    payload={"failed_checks": len(failed), "violations": [r.message for r in failed]},
+                ))
+            return {
+                "user_id": user_id,
+                "checked": len(limits),
+                "passed": len([r for r in limits if r.passed]),
+                "failed": len(failed),
+                "violations": [r.message for r in failed],
+            }
+
+    # ── Phase 6: Liquidation Engine Integration ───────────────────
+
+    async def trigger_liquidations(self, batch_size: int = 50) -> dict:
+        if self._liquidation_repo is None:
+            return {"liquidated": 0, "reason": "liquidation_repo_not_available"}
+        async with self._uow.transaction():
+            price_row = await self._prices.get_latest()
+            if price_row is None:
+                return {"liquidated": 0, "reason": "no_price"}
+            mark_price = Decimal(price_row["sell_price"])
+            positions = await self._positions.list_positions(limit=batch_size)
+            candidates = []
+            for pos in positions:
+                net_kg = Decimal(pos["net_kg"])
+                if net_kg == 0:
+                    continue
+                wallet = await self._wallets.get_wallet(pos["user_id"])
+                if wallet is None:
+                    continue
+                floating = mark_price - Decimal(pos["avg_price_usd"])
+                equity = Decimal(wallet["available_balance_usd"]) + Decimal(wallet["frozen_balance_usd"]) + Decimal(wallet["margin_balance_usd"]) + floating * net_kg
+                margin_req = self._margin_engine.calculate_requirements(
+                    position_value=abs(net_kg) * mark_price,
+                    equity_usd=equity if equity > 0 else Decimal("0"),
+                    leverage=Decimal("1"),
+                    margin_mode="cross",
+                )
+                trigger = self._liquidation_engine.check_liquidation_trigger(
+                    margin_ratio=margin_req.margin_ratio,
+                    maintenance_margin_ratio=Decimal("0.5"),
+                )
+                if trigger:
+                    candidates.append({
+                        "user_id": pos["user_id"],
+                        "net_kg": net_kg,
+                        "avg_price_usd": Decimal(pos["avg_price_usd"]),
+                        "margin_ratio": margin_req.margin_ratio,
+                    })
+            if not candidates:
+                return {"liquidated": 0, "reason": "no_candidates"}
+            orders = [LiquidationOrder(
+                user_id=c["user_id"],
+                position_net_kg=c["net_kg"],
+                avg_price_usd=c["avg_price_usd"],
+                margin_ratio=c["margin_ratio"],
+                mark_price_usd=mark_price,
+                created_at=utc_now(),
+            ) for c in candidates]
+            prioritized = self._liquidation_engine.prioritize(orders, strategy="highest_leverage")
+            liquidated = 0
+            for lq in prioritized[:10]:
+                insurance_balance = await self._liquidation_repo.get_insurance_balance()
+                result = self._liquidation_engine.execute_liquidation(
+                    liquidation_order=lq,
+                    insurance_balance=insurance_balance,
+                    max_close_ratio=Decimal("1"),
+                )
+                await self._wallets.freeze(lq.user_id, abs(result.pnl_usd))
+                pos = await self._positions.get_position(lq.user_id)
+                if pos:
+                    old_net = Decimal(pos["net_kg"])
+                    await self._positions.update_position(
+                        user_id=lq.user_id,
+                        net_kg=Decimal("0"),
+                        avg_price_usd=Decimal("0"),
+                        realized_pnl_usd=Decimal(pos.get("realized_pnl_usd", "0")) + result.pnl_usd,
+                    )
+                await self._liquidation_repo.create_event(
+                    user_id=lq.user_id,
+                    margin_ratio=lq.margin_ratio,
+                    status=LiquidationStatus.completed,
+                    payload={
+                        "pnl_usd": str(result.pnl_usd),
+                        "insurance_used_usd": str(result.insurance_used_usd),
+                        "close_price_usd": str(result.close_price_usd),
+                        "filled_quantity_kg": str(result.filled_quantity_kg),
+                    },
+                )
+                if result.insurance_used_usd > 0:
+                    await self._liquidation_repo.debit_insurance(result.insurance_used_usd)
+                    await self._publish(InsuranceUsed(
+                        aggregate_id=str(lq.user_id),
+                        aggregate_type="user",
+                        actor_user_id=None,
+                        payload={"amount_usd": str(result.insurance_used_usd), "user_id": lq.user_id},
+                    ))
+                await self._publish(LiquidationCompleted(
+                    aggregate_id=str(lq.user_id),
+                    aggregate_type="user",
+                    actor_user_id=None,
+                    payload={"user_id": lq.user_id, "pnl_usd": str(result.pnl_usd)},
+                ))
+                liquidated += 1
+            return {"liquidated": liquidated, "candidates_found": len(candidates)}
+
+    async def get_liquidation_status(self, user_id: int) -> list[dict]:
+        if self._liquidation_repo is None:
+            return []
+        async with self._uow.transaction():
+            return await self._liquidation_repo.list_events(user_id=user_id, limit=20)
+
+    async def get_insurance_balance(self) -> Decimal:
+        if self._liquidation_repo is None:
+            return Decimal("0")
+        async with self._uow.transaction():
+            return await self._liquidation_repo.get_insurance_balance()
+
+    # ── Phase 1: Ledger Service Integration ───────────────────────
+
+    async def get_ledger_entries(self, user_id: int | None = None, limit: int = 50) -> list[dict]:
+        if self._ledger_repo is None:
+            return []
+        async with self._uow.transaction():
+            return await self._ledger_repo.list_entries(user_id=user_id, limit=limit)
+
+    async def get_account_balance(self, account_code: str) -> Decimal:
+        if self._ledger_repo is None:
+            return Decimal("0")
+        async with self._uow.transaction():
+            return await self._ledger_repo.account_balance(account_code)
+
+    async def post_trade_journal_entry(
+        self,
+        user_id: int,
+        buy_order_id: int,
+        sell_order_id: int,
+        trade_price: Decimal,
+        quantity_kg: Decimal,
+        buy_fee_usd: Decimal,
+        sell_fee_usd: Decimal,
+    ) -> None:
+        if self._ledger_repo is None:
+            return
+        async with self._uow.transaction():
+            entry = self._ledger_service.create_trade_entry(
+                user_id=user_id,
+                trade_price=trade_price,
+                quantity_kg=quantity_kg,
+                buy_fee_usd=buy_fee_usd,
+                sell_fee_usd=sell_fee_usd,
+                buy_order_id=buy_order_id,
+                sell_order_id=sell_order_id,
+            )
+            await self._ledger_repo.post_entry(entry)
+            await self._publish(LedgerEntryPosted(
+                aggregate_id=f"ledger:{entry.reference}",
+                aggregate_type="ledger",
+                actor_user_id=user_id,
+                payload={"reference": entry.reference, "entry_type": "trade"},
+            ))

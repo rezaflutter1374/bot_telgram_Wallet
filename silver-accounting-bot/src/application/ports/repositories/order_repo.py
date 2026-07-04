@@ -117,3 +117,29 @@ class OrderRepo(Protocol):
     async def list_pending_cancellations(self, limit: int = 50) -> list[dict]: ...
 
     async def get_trade(self, trade_id: int) -> dict | None: ...
+
+    async def replace_order(
+        self,
+        order_id: int,
+        *,
+        quantity_kg: Decimal | None = None,
+        limit_price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        quote_expires_at: datetime | None = None,
+    ) -> dict: ...
+
+    async def list_by_status(
+        self,
+        status: OrderStatus,
+        *,
+        side: OrderSide | None = None,
+        limit: int = 100,
+    ) -> list[dict]: ...
+
+    async def list_trades_for_user(
+        self,
+        user_id: int,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]: ...
